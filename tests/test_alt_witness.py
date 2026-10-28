@@ -2,19 +2,33 @@
 
 import hashlib
 import json
+import zlib
 
 import pytest
 
 
 CONTRACT = "contracts/alt_witness.py"
-WEB = r"upload\.wikimedia\.org/wikipedia/commons/thumb/.+Red_Apple\.jpg"
+WEB = r"upload\.wikimedia\.org/wikipedia/commons/thumb/"
 PROMPT = r"Read the image pixels"
 URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/1/15/Red_Apple.jpg/330px-Red_Apple.jpg"
+PNG_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/8d/Red_Apple_edit.png/330px-Red_Apple_edit.png"
 PINNED_GITHUB = "https://raw.githubusercontent.com/user/repo/" + "a" * 40 + "/image.png"
 IMAGE = b"\xff\xd8\xff" + b"offline-visual-fixture" * 4 + b"\xff\xd9"
 IMAGE_HASH = hashlib.sha256(IMAGE).hexdigest()
 WRONG = "A blue bicycle."
 RIGHT = "A red apple."
+
+
+def png_chunk(tag, body):
+    return (len(body).to_bytes(4, "big") + tag + body +
+            (zlib.crc32(tag + body) & 0xffffffff).to_bytes(4, "big"))
+
+
+PNG = (b"\x89PNG\r\n\x1a\n" +
+       png_chunk(b"IHDR", (2).to_bytes(4, "big") * 2 + b"\x08\x02\x00\x00\x00") +
+       png_chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff\x00\x00" * 2) * 2)) +
+       png_chunk(b"IEND", b""))
+PNG_HASH = hashlib.sha256(PNG).hexdigest()
 
 
 def sender(value):
@@ -104,6 +118,18 @@ def test_detail_not_claimed_does_not_invent_failure(direct_deploy, direct_vm):
     llm(direct_vm, model("MATCH", "NOT_CLAIMED", "apple"))
     assert c.review(ident) == "CLAIMS_SUPPORTED"
     assert direct_vm.run_validator() is True
+
+
+def test_real_png_container_uses_pinned_vision_path(direct_deploy, direct_vm):
+    # The fixture is a complete, CRC-correct 2x2 red PNG, not just image magic.
+    c = direct_deploy(CONTRACT)
+    ident = c.open(PNG_URL, PNG_HASH, "A red square.")
+    web(direct_vm, body=PNG)
+    llm(direct_vm, model("MATCH", "NOT_CLAIMED", "red square"))
+    assert c.review(ident) == "CLAIMS_SUPPORTED"
+    assert direct_vm.run_validator() is True
+    assert case(c, ident)["image_hash"] == PNG_HASH
+    assert case(c, ident)["image_size"] == len(PNG)
 
 
 def test_equivalence_tolerates_only_nonconsequential_detail_variance(direct_deploy,
@@ -211,6 +237,27 @@ def test_invalid_image_bytes_never_reach_model(direct_deploy, direct_vm, body):
     web(direct_vm, body=body)
     assert c.review(ident) == "SOURCE_UNAVAILABLE"
     assert direct_vm.run_validator() is True
+
+
+def test_vision_failure_is_not_reported_as_an_http_failure(direct_deploy,
+                                                             direct_vm):
+    c = direct_deploy(CONTRACT)
+    ident = c.open(URL, IMAGE_HASH, RIGHT)
+    web(direct_vm)
+    direct_vm.strict_mocks = True  # No model mock: inference/decoder fails.
+    assert c.review(ident) == "VISION_UNAVAILABLE"
+    packet = case(c, ident)
+    assert packet["image_hash"] == IMAGE_HASH
+    assert packet["image_size"] == len(IMAGE)
+    assert packet["subject"] == "" and packet["detail"] == ""
+    assert direct_vm.run_validator() is True
+    direct_vm.clear_mocks()
+    web(direct_vm)
+    llm(direct_vm, model("MATCH", "MATCH", "apple", "red"))
+    proposed = {key: packet[key] for key in (
+        "image_hash", "image_size", "subject", "detail", "subject_quote", "detail_quote")}
+    proposed["state"] = "VISION_UNAVAILABLE"
+    assert direct_vm.run_validator(leader_result=proposed) is False
 
 
 def test_changed_image_hash_is_distinct_from_network_outage(direct_deploy, direct_vm):
