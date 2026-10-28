@@ -103,7 +103,7 @@ def _check_packet(packet, alt_text: str) -> bool:
     if not isinstance(packet, dict) or set(packet) != FIELDS:
         return False
     state = packet["state"]
-    if state not in ("OK", "UNAVAILABLE", "IMAGE_CHANGED"):
+    if state not in ("OK", "UNAVAILABLE", "IMAGE_CHANGED", "VISION_UNAVAILABLE"):
         return False
     digest = packet["image_hash"]
     size = packet["image_size"]
@@ -114,7 +114,7 @@ def _check_packet(packet, alt_text: str) -> bool:
         return digest == "" and size == 0 and all(packet[key] == "" for key in MODEL_FIELDS)
     if re.fullmatch(r"[0-9a-f]{64}", digest) is None or size < 8:
         return False
-    if state == "IMAGE_CHANGED":
+    if state in ("IMAGE_CHANGED", "VISION_UNAVAILABLE"):
         return all(packet[key] == "" for key in MODEL_FIELDS)
     try:
         _parse_model({key: packet[key] for key in MODEL_FIELDS}, alt_text)
@@ -134,6 +134,8 @@ def _status(packet: dict) -> str:
         return "SOURCE_UNAVAILABLE"
     if packet["state"] == "IMAGE_CHANGED":
         return "IMAGE_CHANGED"
+    if packet["state"] == "VISION_UNAVAILABLE":
+        return "VISION_UNAVAILABLE"
     if packet["subject"] == "MISMATCH" or packet["detail"] == "MISMATCH":
         return "CLAIMS_CONTRADICTED"
     if packet["subject"] == "UNKNOWN" or packet["detail"] == "UNKNOWN":
@@ -212,9 +214,13 @@ class AltWitness(gl.Contract):
                 "subject_quote, detail_quote. No final verdict.\n"
                 "ALT_TEXT_JSON: " + _canon(alt_text)
             )
-            assessment = gl.nondet.exec_prompt(
-                prompt, images=[body], response_format="json"
-            )
+            try:
+                assessment = gl.nondet.exec_prompt(
+                    prompt, images=[body], response_format="json"
+                )
+            except Exception:
+                # Image decoder or model failure is not an HTTP/source outage.
+                return _empty("VISION_UNAVAILABLE", digest, len(body))
             fields = _parse_model(assessment, alt_text)
             return {"state": "OK", "image_hash": digest,
                     "image_size": len(body), **fields}
